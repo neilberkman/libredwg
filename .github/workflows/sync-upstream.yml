@@ -1,0 +1,151 @@
+name: Sync with Upstream and Build
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force a build even if no upstream changes'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.sync.outputs.has_changes }}
+    steps:
+    - name: Checkout fork
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+        
+    - name: Configure git
+      run: |
+        git config user.name 'github-actions[bot]'
+        git config user.email 'github-actions[bot]@users.noreply.github.com'
+        
+    - name: Add upstream remote
+      run: |
+        git remote add upstream https://github.com/LibreDWG/libredwg.git || true
+        git fetch upstream
+        
+    - name: Sync with upstream
+      id: sync
+      run: |
+        # Get current HEAD
+        BEFORE_SYNC=$(git rev-parse HEAD)
+        
+        # Checkout master and merge upstream
+        git checkout master || git checkout -b master
+        git merge upstream/master --no-edit || {
+          # If merge fails, try rebase
+          git merge --abort
+          git rebase upstream/master
+        }
+        
+        # Check if there were changes
+        AFTER_SYNC=$(git rev-parse HEAD)
+        if [ "$BEFORE_SYNC" != "$AFTER_SYNC" ]; then
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "Changes detected from upstream"
+        else
+          echo "has_changes=false" >> $GITHUB_OUTPUT
+          echo "No changes from upstream"
+        fi
+        
+    - name: Push changes
+      if: steps.sync.outputs.has_changes == 'true'
+      run: |
+        git push origin master
+        
+  trigger-builds:
+    needs: sync
+    if: needs.sync.outputs.has_changes == 'true' || github.event.inputs.force_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: master
+        
+    - name: Trigger main workflow
+      uses: actions/github-script@v7
+      with:
+        script: |
+          await github.rest.actions.createWorkflowDispatch({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            workflow_id: 'main.yml',
+            ref: 'master'
+          });
+          
+    - name: Create sync report
+      if: needs.sync.outputs.has_changes == 'true'
+      run: |
+        echo "## Upstream Sync Report" > sync-report.md
+        echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> sync-report.md
+        echo "**Status:** Successfully synced with upstream and triggered builds" >> sync-report.md
+        echo "" >> sync-report.md
+        echo "### Recent upstream commits:" >> sync-report.md
+        git log --oneline -10 upstream/master >> sync-report.md
+        
+    - name: Upload sync report
+      if: needs.sync.outputs.has_changes == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: sync-report
+        path: sync-report.md
+        retention-days: 30
+        
+  # Optional: Create nightly releases from synced code
+  nightly-release:
+    needs: [sync, trigger-builds]
+    if: needs.sync.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: master
+        
+    - name: Generate nightly tag
+      id: tag
+      run: |
+        TAG="nightly-$(date -u '+%Y%m%d')"
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        
+    - name: Create nightly tag
+      run: |
+        git config user.name 'github-actions[bot]'
+        git config user.email 'github-actions[bot]@users.noreply.github.com'
+        git tag -a "${{ steps.tag.outputs.tag }}" -m "Nightly build from upstream sync"
+        git push origin "${{ steps.tag.outputs.tag }}"
+        
+    - name: Wait for builds to complete
+      run: |
+        echo "Waiting for builds to complete (timeout after 2 hours)..."
+        # Poll workflow runs for up to 2 hours
+        for i in {1..120}; do
+          sleep 60
+          # Check if the main workflow completed
+          STATUS=$(gh run list --workflow=main.yml --limit=1 --json status -q '.[0].status')
+          if [ "$STATUS" = "completed" ]; then
+            echo "Builds completed!"
+            break
+          fi
+          echo "Still waiting... (${i}/120)"
+        done
+        
+    - name: Create nightly release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release create "${{ steps.tag.outputs.tag }}" \
+          --title "Nightly Build ${{ steps.tag.outputs.tag }}" \
+          --notes "Automated nightly build synced from upstream LibreDWG/libredwg" \
+          --prerelease
